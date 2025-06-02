@@ -1,0 +1,494 @@
+-- Field Service Management System - Fresh Database Setup
+-- Run this in your Supabase SQL Editor to create everything from scratch
+
+-- ============================================================================
+-- STEP 1: Clean slate - Drop all existing tables
+-- ============================================================================
+
+-- Drop tables in correct order (respecting foreign key dependencies)
+DROP TABLE IF EXISTS file_attachments CASCADE;
+DROP TABLE IF EXISTS audit_logs CASCADE;
+DROP TABLE IF EXISTS notifications CASCADE;
+DROP TABLE IF EXISTS schedules CASCADE;
+DROP TABLE IF EXISTS user_locations CASCADE;
+DROP TABLE IF EXISTS inventory_transactions CASCADE;
+DROP TABLE IF EXISTS inventory_items CASCADE;
+DROP TABLE IF EXISTS form_submissions CASCADE;
+DROP TABLE IF EXISTS forms CASCADE;
+DROP TABLE IF EXISTS work_orders CASCADE;
+DROP TABLE IF EXISTS users CASCADE;
+DROP TABLE IF EXISTS tenants CASCADE;
+
+-- Drop custom types
+DROP TYPE IF EXISTS user_role CASCADE;
+DROP TYPE IF EXISTS subscription_tier CASCADE;
+DROP TYPE IF EXISTS work_order_status CASCADE;
+DROP TYPE IF EXISTS work_order_priority CASCADE;
+DROP TYPE IF EXISTS form_field_type CASCADE;
+DROP TYPE IF EXISTS inventory_transaction_type CASCADE;
+
+-- Drop functions and triggers
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+DROP FUNCTION IF EXISTS public.handle_new_user() CASCADE;
+DROP FUNCTION IF EXISTS update_updated_at_column() CASCADE;
+
+-- ============================================================================
+-- STEP 2: Enable extensions and create types
+-- ============================================================================
+
+-- Enable necessary extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- Create custom types
+CREATE TYPE user_role AS ENUM ('super_admin', 'admin', 'manager', 'dispatcher', 'field_rep');
+CREATE TYPE subscription_tier AS ENUM ('basic', 'professional', 'enterprise');
+CREATE TYPE work_order_status AS ENUM ('pending', 'assigned', 'in_progress', 'completed', 'cancelled');
+CREATE TYPE work_order_priority AS ENUM ('low', 'medium', 'high', 'urgent');
+CREATE TYPE form_field_type AS ENUM ('text', 'textarea', 'number', 'date', 'datetime', 'select', 'checkbox', 'radio', 'file', 'photo', 'signature', 'gps');
+CREATE TYPE inventory_transaction_type AS ENUM ('in', 'out', 'transfer', 'adjustment');
+
+-- ============================================================================
+-- STEP 3: Create core tables
+-- ============================================================================
+
+-- Tenants table (Multi-tenant architecture)
+CREATE TABLE tenants (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    subdomain VARCHAR(100) UNIQUE NOT NULL,
+    subscription_tier subscription_tier DEFAULT 'basic',
+    subscription_start_date TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    subscription_end_date TIMESTAMP WITH TIME ZONE,
+    max_users INTEGER DEFAULT 5,
+    max_work_orders INTEGER DEFAULT 100,
+    max_storage_mb INTEGER DEFAULT 1000,
+    is_active BOOLEAN DEFAULT true,
+    settings JSONB DEFAULT '{}',
+    billing_contact_email VARCHAR(255),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Users table (links to Supabase auth.users)
+-- NO password_hash column - Supabase Auth handles authentication
+CREATE TABLE users (
+    id UUID PRIMARY KEY, -- This will match auth.users.id
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    email VARCHAR(255) NOT NULL,
+    first_name VARCHAR(100) NOT NULL,
+    last_name VARCHAR(100) NOT NULL,
+    role user_role DEFAULT 'field_rep',
+    phone VARCHAR(20),
+    avatar_url TEXT,
+    is_active BOOLEAN DEFAULT true,
+    last_login TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Work Orders table
+CREATE TABLE work_orders (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    status work_order_status DEFAULT 'pending',
+    priority work_order_priority DEFAULT 'medium',
+    assigned_to UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    location_address TEXT NOT NULL,
+    location_lat DECIMAL(10, 8),
+    location_lng DECIMAL(11, 8),
+    scheduled_date TIMESTAMP WITH TIME ZONE,
+    estimated_duration INTEGER, -- in minutes
+    actual_duration INTEGER, -- in minutes
+    completed_at TIMESTAMP WITH TIME ZONE,
+    notes TEXT,
+    attachments JSONB DEFAULT '[]',
+    custom_fields JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Forms table (Dynamic form builder)
+CREATE TABLE forms (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    fields JSONB NOT NULL DEFAULT '[]',
+    is_active BOOLEAN DEFAULT true,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Form Submissions table
+CREATE TABLE form_submissions (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    form_id UUID NOT NULL REFERENCES forms(id) ON DELETE CASCADE,
+    work_order_id UUID REFERENCES work_orders(id) ON DELETE CASCADE,
+    submitted_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    data JSONB NOT NULL DEFAULT '{}',
+    location_lat DECIMAL(10, 8),
+    location_lng DECIMAL(11, 8),
+    submitted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Inventory Items table
+CREATE TABLE inventory_items (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    sku VARCHAR(100),
+    category VARCHAR(100),
+    unit_price DECIMAL(10, 2) DEFAULT 0,
+    current_stock INTEGER DEFAULT 0,
+    min_stock_level INTEGER DEFAULT 0,
+    max_stock_level INTEGER,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(tenant_id, sku)
+);
+
+-- Inventory Transactions table
+CREATE TABLE inventory_transactions (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    item_id UUID NOT NULL REFERENCES inventory_items(id) ON DELETE CASCADE,
+    work_order_id UUID REFERENCES work_orders(id) ON DELETE SET NULL,
+    transaction_type inventory_transaction_type NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price DECIMAL(10, 2),
+    total_price DECIMAL(10, 2),
+    reference_number VARCHAR(100),
+    notes TEXT,
+    performed_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- User Locations table (GPS tracking)
+CREATE TABLE user_locations (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    location_lat DECIMAL(10, 8) NOT NULL,
+    location_lng DECIMAL(11, 8) NOT NULL,
+    accuracy DECIMAL(8, 2),
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    work_order_id UUID REFERENCES work_orders(id) ON DELETE SET NULL
+);
+
+-- Schedules table
+CREATE TABLE schedules (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    work_order_id UUID NOT NULL REFERENCES work_orders(id) ON DELETE CASCADE,
+    scheduled_start TIMESTAMP WITH TIME ZONE NOT NULL,
+    scheduled_end TIMESTAMP WITH TIME ZONE NOT NULL,
+    actual_start TIMESTAMP WITH TIME ZONE,
+    actual_end TIMESTAMP WITH TIME ZONE,
+    notes TEXT,
+    created_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Notifications table
+CREATE TABLE notifications (
+    id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
+    tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
+    type VARCHAR(50) DEFAULT 'info',
+    is_read BOOLEAN DEFAULT false,
+    related_entity_type VARCHAR(50),
+    related_entity_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- ============================================================================
+-- STEP 4: Create indexes for performance
+-- ============================================================================
+
+-- Users table indexes
+CREATE INDEX idx_users_tenant_id ON users(tenant_id);
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_role ON users(role);
+
+-- Work orders indexes
+CREATE INDEX idx_work_orders_tenant_id ON work_orders(tenant_id);
+CREATE INDEX idx_work_orders_assigned_to ON work_orders(assigned_to);
+CREATE INDEX idx_work_orders_status ON work_orders(status);
+CREATE INDEX idx_work_orders_priority ON work_orders(priority);
+CREATE INDEX idx_work_orders_created_at ON work_orders(created_at);
+
+-- Forms and submissions indexes
+CREATE INDEX idx_forms_tenant_id ON forms(tenant_id);
+CREATE INDEX idx_form_submissions_tenant_id ON form_submissions(tenant_id);
+CREATE INDEX idx_form_submissions_form_id ON form_submissions(form_id);
+CREATE INDEX idx_form_submissions_work_order_id ON form_submissions(work_order_id);
+
+-- Inventory indexes
+CREATE INDEX idx_inventory_items_tenant_id ON inventory_items(tenant_id);
+CREATE INDEX idx_inventory_items_category ON inventory_items(category);
+CREATE INDEX idx_inventory_transactions_tenant_id ON inventory_transactions(tenant_id);
+CREATE INDEX idx_inventory_transactions_item_id ON inventory_transactions(item_id);
+
+-- Location and schedule indexes
+CREATE INDEX idx_user_locations_user_id ON user_locations(user_id);
+CREATE INDEX idx_user_locations_timestamp ON user_locations(timestamp);
+CREATE INDEX idx_schedules_user_id ON schedules(user_id);
+CREATE INDEX idx_schedules_work_order_id ON schedules(work_order_id);
+CREATE INDEX idx_schedules_scheduled_start ON schedules(scheduled_start);
+
+-- Notifications indexes
+CREATE INDEX idx_notifications_user_id ON notifications(user_id);
+CREATE INDEX idx_notifications_is_read ON notifications(is_read);
+CREATE INDEX idx_notifications_created_at ON notifications(created_at);
+
+-- ============================================================================
+-- STEP 5: Create updated_at trigger function
+-- ============================================================================
+
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Add updated_at triggers to relevant tables
+CREATE TRIGGER update_tenants_updated_at BEFORE UPDATE ON tenants FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_work_orders_updated_at BEFORE UPDATE ON work_orders FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_forms_updated_at BEFORE UPDATE ON forms FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_inventory_items_updated_at BEFORE UPDATE ON inventory_items FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+CREATE TRIGGER update_schedules_updated_at BEFORE UPDATE ON schedules FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================================================
+-- STEP 6: Set up Supabase Auth integration
+-- ============================================================================
+
+-- Function to handle new user signups
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER AS $$
+BEGIN
+  -- Insert into public.users table when a new user is created in auth.users
+  INSERT INTO public.users (
+    id, 
+    tenant_id, 
+    email, 
+    first_name, 
+    last_name, 
+    role, 
+    created_at
+  )
+  VALUES (
+    NEW.id,
+    COALESCE(
+      (NEW.raw_user_meta_data->>'tenant_id')::UUID, 
+      '11111111-1111-1111-1111-111111111111'
+    ),
+    NEW.email,
+    COALESCE(NEW.raw_user_meta_data->>'first_name', 'User'),
+    COALESCE(NEW.raw_user_meta_data->>'last_name', 'Name'),
+    COALESCE(NEW.raw_user_meta_data->>'role', 'field_rep')::user_role,
+    NOW()
+  );
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Create trigger for automatic user creation
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- ============================================================================
+-- STEP 7: Insert sample data
+-- ============================================================================
+
+-- Insert sample tenants
+INSERT INTO tenants (id, name, subdomain, subscription_tier, max_users, max_work_orders, billing_contact_email) VALUES
+('11111111-1111-1111-1111-111111111111', 'Acme Field Services', 'acme', 'professional', 25, 500, 'admin@acme.com'),
+('22222222-2222-2222-2222-222222222222', 'TechCorp Solutions', 'techcorp', 'enterprise', 100, 2000, 'billing@techcorp.com');
+
+-- Create sample users in Supabase Auth (this will trigger our function to create profile records)
+INSERT INTO auth.users (
+    instance_id,
+    id,
+    aud,
+    role,
+    email,
+    encrypted_password,
+    email_confirmed_at,
+    raw_app_meta_data,
+    raw_user_meta_data,
+    created_at,
+    updated_at,
+    confirmation_token,
+    email_change,
+    email_change_token_new,
+    recovery_token
+) VALUES 
+-- Admin User
+(
+    '00000000-0000-0000-0000-000000000000',
+    '33333333-3333-3333-3333-333333333333',
+    'authenticated',
+    'authenticated',
+    'admin@acme.com',
+    crypt('password123', gen_salt('bf')),
+    NOW(),
+    '{"provider": "email", "providers": ["email"]}',
+    '{"first_name": "Admin", "last_name": "User", "role": "admin", "tenant_id": "11111111-1111-1111-1111-111111111111"}',
+    NOW(),
+    NOW(),
+    '',
+    '',
+    '',
+    ''
+),
+-- Field Rep User
+(
+    '00000000-0000-0000-0000-000000000000',
+    '44444444-4444-4444-4444-444444444444',
+    'authenticated',
+    'authenticated',
+    'john.doe@acme.com',
+    crypt('password123', gen_salt('bf')),
+    NOW(),
+    '{"provider": "email", "providers": ["email"]}',
+    '{"first_name": "John", "last_name": "Doe", "role": "field_rep", "tenant_id": "11111111-1111-1111-1111-111111111111"}',
+    NOW(),
+    NOW(),
+    '',
+    '',
+    '',
+    ''
+),
+-- Manager User
+(
+    '00000000-0000-0000-0000-000000000000',
+    '55555555-5555-5555-5555-555555555555',
+    'authenticated',
+    'authenticated',
+    'manager@techcorp.com',
+    crypt('password123', gen_salt('bf')),
+    NOW(),
+    '{"provider": "email", "providers": ["email"]}',
+    '{"first_name": "Jane", "last_name": "Manager", "role": "manager", "tenant_id": "22222222-2222-2222-2222-222222222222"}',
+    NOW(),
+    NOW(),
+    '',
+    '',
+    '',
+    ''
+)
+ON CONFLICT (id) DO UPDATE SET
+    email = EXCLUDED.email,
+    encrypted_password = EXCLUDED.encrypted_password,
+    raw_user_meta_data = EXCLUDED.raw_user_meta_data,
+    updated_at = NOW();
+
+-- Manually insert users into users table (in case trigger doesn't fire immediately)
+INSERT INTO users (id, tenant_id, email, first_name, last_name, role, created_at) VALUES
+('33333333-3333-3333-3333-333333333333', '11111111-1111-1111-1111-111111111111', 'admin@acme.com', 'Admin', 'User', 'admin', NOW()),
+('44444444-4444-4444-4444-444444444444', '11111111-1111-1111-1111-111111111111', 'john.doe@acme.com', 'John', 'Doe', 'field_rep', NOW()),
+('55555555-5555-5555-5555-555555555555', '22222222-2222-2222-2222-222222222222', 'manager@techcorp.com', 'Jane', 'Manager', 'manager', NOW())
+ON CONFLICT (id) DO UPDATE SET
+    email = EXCLUDED.email,
+    first_name = EXCLUDED.first_name,
+    last_name = EXCLUDED.last_name,
+    role = EXCLUDED.role;
+
+-- Insert sample work orders
+INSERT INTO work_orders (id, tenant_id, title, description, status, priority, assigned_to, created_by, location_address, location_lat, location_lng) VALUES
+('66666666-6666-6666-6666-666666666666', '11111111-1111-1111-1111-111111111111', 'HVAC Maintenance', 'Routine maintenance check for HVAC system', 'assigned', 'medium', '44444444-4444-4444-4444-444444444444', '33333333-3333-3333-3333-333333333333', '123 Main St, Amsterdam, Netherlands', 52.3676, 4.9041),
+('77777777-7777-7777-7777-777777777777', '11111111-1111-1111-1111-111111111111', 'Plumbing Repair', 'Fix leaky pipes in office building', 'pending', 'high', NULL, '33333333-3333-3333-3333-333333333333', '456 Business Ave, Amsterdam, Netherlands', 52.3702, 4.8952),
+('88888888-8888-8888-8888-888888888888', '22222222-2222-2222-2222-222222222222', 'Network Installation', 'Install fiber optic network', 'in_progress', 'high', '55555555-5555-5555-5555-555555555555', '55555555-5555-5555-5555-555555555555', '789 Tech Park, Amsterdam, Netherlands', 52.3584, 4.8720);
+
+-- Insert sample forms
+INSERT INTO forms (id, tenant_id, name, description, fields, created_by) VALUES
+('99999999-9999-9999-9999-999999999999', '11111111-1111-1111-1111-111111111111', 'HVAC Inspection Form', 'Standard HVAC inspection checklist', 
+'[
+    {"id": "temp_reading", "type": "number", "label": "Temperature Reading (°C)", "required": true},
+    {"id": "pressure_check", "type": "checkbox", "label": "Pressure Check Completed", "required": true},
+    {"id": "filter_condition", "type": "select", "label": "Filter Condition", "options": ["Good", "Fair", "Needs Replacement"], "required": true},
+    {"id": "notes", "type": "textarea", "label": "Additional Notes", "required": false},
+    {"id": "photo", "type": "photo", "label": "System Photo", "required": false}
+]', '33333333-3333-3333-3333-333333333333'),
+('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', '11111111-1111-1111-1111-111111111111', 'Safety Inspection', 'General safety inspection form',
+'[
+    {"id": "safety_equipment", "type": "checkbox", "label": "Safety Equipment Present", "required": true},
+    {"id": "hazards_noted", "type": "textarea", "label": "Hazards Noted", "required": false},
+    {"id": "signature", "type": "signature", "label": "Inspector Signature", "required": true}
+]', '33333333-3333-3333-3333-333333333333');
+
+-- Insert sample inventory items
+INSERT INTO inventory_items (tenant_id, name, description, sku, category, unit_price, current_stock, min_stock_level) VALUES
+('11111111-1111-1111-1111-111111111111', 'Air Filter - 16x20x1', 'Standard air filter for HVAC systems', 'AF-16201', 'Filters', 12.50, 25, 5),
+('11111111-1111-1111-1111-111111111111', 'Refrigerant R-410A', 'Refrigerant for modern HVAC systems', 'REF-410A', 'Refrigerants', 45.00, 10, 2),
+('11111111-1111-1111-1111-111111111111', 'Copper Pipe 1/2 inch', 'Copper piping for plumbing repairs', 'PIPE-CU-05', 'Plumbing', 8.75, 50, 10),
+('11111111-1111-1111-1111-111111111111', 'Thermostat - Digital', 'Programmable digital thermostat', 'THERMO-DIG-01', 'Controls', 89.99, 15, 3),
+('22222222-2222-2222-2222-222222222222', 'Network Cable - Cat6', 'Category 6 Ethernet cable per meter', 'NET-CAT6-M', 'Networking', 2.50, 500, 100),
+('22222222-2222-2222-2222-222222222222', 'Fiber Optic Cable', 'Single-mode fiber optic cable per meter', 'FIB-SM-M', 'Networking', 5.75, 200, 50);
+
+-- Insert sample form submission
+INSERT INTO form_submissions (tenant_id, form_id, work_order_id, submitted_by, data, submitted_at) VALUES
+('11111111-1111-1111-1111-111111111111', '99999999-9999-9999-9999-999999999999', '66666666-6666-6666-6666-666666666666', '44444444-4444-4444-4444-444444444444', 
+'{"temp_reading": 22, "pressure_check": true, "filter_condition": "Good", "notes": "System operating normally"}', NOW() - INTERVAL '2 hours');
+
+-- ============================================================================
+-- STEP 8: Final verification and success message
+-- ============================================================================
+
+-- Verify setup
+DO $$
+DECLARE
+    tenant_count INTEGER;
+    user_count INTEGER;
+    work_order_count INTEGER;
+    form_count INTEGER;
+    inventory_count INTEGER;
+BEGIN
+    SELECT COUNT(*) INTO tenant_count FROM tenants;
+    SELECT COUNT(*) INTO user_count FROM users;
+    SELECT COUNT(*) INTO work_order_count FROM work_orders;
+    SELECT COUNT(*) INTO form_count FROM forms;
+    SELECT COUNT(*) INTO inventory_count FROM inventory_items;
+    
+    RAISE NOTICE '';
+    RAISE NOTICE '🎉 ============================================';
+    RAISE NOTICE '🎉 DATABASE SETUP COMPLETED SUCCESSFULLY!';
+    RAISE NOTICE '🎉 ============================================';
+    RAISE NOTICE '';
+    RAISE NOTICE '📊 Created:';
+    RAISE NOTICE '   • % tenants', tenant_count;
+    RAISE NOTICE '   • % users', user_count;
+    RAISE NOTICE '   • % work orders', work_order_count;
+    RAISE NOTICE '   • % forms', form_count;
+    RAISE NOTICE '   • % inventory items', inventory_count;
+    RAISE NOTICE '';
+    RAISE NOTICE '🔐 Test Login Credentials:';
+    RAISE NOTICE '   • admin@acme.com / password123 (Admin)';
+    RAISE NOTICE '   • john.doe@acme.com / password123 (Field Rep)';
+    RAISE NOTICE '   • manager@techcorp.com / password123 (Manager)';
+    RAISE NOTICE '';
+    RAISE NOTICE '✅ Supabase Auth integration configured';
+    RAISE NOTICE '✅ Automatic user creation trigger set up';
+    RAISE NOTICE '✅ All tables, indexes, and relationships created';
+    RAISE NOTICE '✅ Sample data loaded';
+    RAISE NOTICE '';
+    RAISE NOTICE '🚀 Ready to use your Field Service Management System!';
+    RAISE NOTICE '📱 Visit: http://localhost:3000';
+    RAISE NOTICE '';
+END $$;
